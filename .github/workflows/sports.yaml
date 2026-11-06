@@ -1,0 +1,706 @@
+name: Sports data
+
+# Collects fixtures (your three teams, and the games on today) and saves them as sports.json next to the page.
+# Runs every 5 minutes, but does real work only when needed: a full collection about once an hour, and in between a quick
+# refresh of the games that are on right now (minute, quarter, lap). When nothing is on it stops after a second.
+# The page reads sports.json; if nothing is found, the page shows nothing. Run it by hand: Actions > Sports data > Run workflow.
+# Optional hand-kept list of games that no free source has (the national basketball team): sports-extra.json
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weather-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect fixtures
+        env:
+          SPORTS_MODE: ${{ github.event_name == 'workflow_dispatch' && 'full' || 'auto' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, time, datetime, urllib.request, urllib.error
+          from concurrent.futures import ThreadPoolExecutor
+          from zoneinfo import ZoneInfo
+
+          # Collects fixtures from free sources and writes sports.json for the weather page.
+          # Today = Estonian date. Anything that cannot be found is simply left out of the file.
+
+          TZ = ZoneInfo('Europe/Tallinn')
+          UTC = datetime.timezone.utc
+          NOW = datetime.datetime.now(UTC)
+          D0 = NOW.astimezone(TZ).date()
+          DAYS = (D0, D0 + datetime.timedelta(days=1))
+          ESPN_BASE = 'https://site.api.espn.com/apis/site/v2/sports/'
+          ESPN = ESPN_BASE + 'soccer/'
+
+
+          def espn_url(slug):
+              return (ESPN_BASE if '/' in slug else ESPN) + slug
+
+
+          NBA = 'basketball/nba'
+          NBA_DAYS = (D0 - datetime.timedelta(days=1), D0, D0 + datetime.timedelta(days=1))   # US evening games are the Estonian night after
+          UA = 'Mozilla/5.0 (compatible; ilm-sports/1.0)'
+          OUT = 'sports.json'
+          EXTRA = 'sports-extra.json'
+
+          # competitions for the "on today" list: (ESPN code, short tag, priority tier)
+          COMPS = [
+              ('eng.1', 'EPL', 1), ('uefa.champions', 'UCL', 1), ('fifa.world', 'MM', 1), ('uefa.euro', 'EM', 1),
+              ('fra.1', 'L1', 2), ('ger.1', 'BL', 2), ('esp.1', 'LL', 2), ('ita.1', 'SA', 2),
+              ('uefa.europa', 'EL', 2), ('uefa.europa.conf', 'KL', 2),
+              ('eng.fa', 'FA', 2), ('eng.league_cup', 'LC', 2), ('ger.dfb_pokal', 'DFB', 2),
+              ('esp.copa_del_rey', 'CdR', 2), ('ita.coppa_italia', 'CI', 2), ('fra.coupe_de_france', 'CdF', 2),
+              ('est.1', 'MEI', 3),
+              (NBA, 'NBA', 3),
+          ]
+          # the three teams: ESPN team id and the competitions to look in
+          TEAMS = {
+              'lfc': dict(id='364', slugs=['eng.1', 'uefa.champions', 'eng.fa', 'eng.league_cup'], nat=False),
+              'eefb': dict(id='444', slugs=['uefa.nations', 'fifa.friendly', 'fifa.worldq.uefa', 'uefa.euroq'], nat=True),
+              'eebb': dict(id=None, slugs=[], nat=True),
+          }
+
+          ET = {'Estonia': 'Eesti', 'Luxembourg': 'Luksemburg', 'Bulgaria': 'Bulgaaria', 'Latvia': 'Läti', 'Lithuania': 'Leedu',
+                'Finland': 'Soome', 'Sweden': 'Rootsi', 'Norway': 'Norra', 'Denmark': 'Taani', 'Iceland': 'Island', 'Germany': 'Saksamaa',
+                'France': 'Prantsusmaa', 'Spain': 'Hispaania', 'Italy': 'Itaalia', 'England': 'Inglismaa', 'Scotland': 'Šotimaa',
+                'Wales': 'Wales', 'Northern Ireland': 'Põhja-Iirimaa', 'Ireland': 'Iirimaa', 'Republic of Ireland': 'Iirimaa',
+                'Netherlands': 'Holland', 'Belgium': 'Belgia', 'Portugal': 'Portugal', 'Switzerland': 'Šveits', 'Austria': 'Austria',
+                'Poland': 'Poola', 'Czechia': 'Tšehhi', 'Czech Republic': 'Tšehhi', 'Slovakia': 'Slovakkia', 'Hungary': 'Ungari',
+                'Romania': 'Rumeenia', 'Greece': 'Kreeka', 'Turkey': 'Türgi', 'Türkiye': 'Türgi', 'Croatia': 'Horvaatia',
+                'Serbia': 'Serbia', 'Slovenia': 'Sloveenia', 'Bosnia and Herzegovina': 'Bosnia ja Hertsegoviina', 'Bosnia-Herzegovina': 'Bosnia ja Hertsegoviina',
+                'Montenegro': 'Montenegro', 'North Macedonia': 'Põhja-Makedoonia', 'Albania': 'Albaania', 'Kosovo': 'Kosovo',
+                'Ukraine': 'Ukraina', 'Belarus': 'Valgevene', 'Moldova': 'Moldova', 'Georgia': 'Gruusia', 'Armenia': 'Armeenia',
+                'Azerbaijan': 'Aserbaidžaan', 'Kazakhstan': 'Kasahstan', 'Cyprus': 'Küpros', 'Malta': 'Malta', 'Andorra': 'Andorra',
+                'San Marino': 'San Marino', 'Gibraltar': 'Gibraltar', 'Faroe Islands': 'Fääri saared', 'Liechtenstein': 'Liechtenstein',
+                'Israel': 'Iisrael', 'Brazil': 'Brasiilia', 'Argentina': 'Argentiina', 'United States': 'USA', 'USA': 'USA', 'Mexico': 'Mehhiko',
+                'Japan': 'Jaapan', 'Canada': 'Kanada'}
+          # domestic cups only count when a club from that country's top league plays (the early rounds are full of small clubs)
+          CUP_LEAGUE = {'eng.fa': 'eng.1', 'eng.league_cup': 'eng.1', 'ger.dfb_pokal': 'ger.1', 'esp.copa_del_rey': 'esp.1',
+                        'ita.coppa_italia': 'ita.1', 'fra.coupe_de_france': 'fra.1'}
+          MONTHS = {m: i + 1 for i, m in enumerate(['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'])}
+
+          DIAG = []          # (group, what, outcome)
+          OK_SRC = set()     # sources that answered
+          BAD_SRC = set()    # sources that failed in a way worth retrying (carry the old data over)
+
+
+          def log(group, what, outcome):
+              DIAG.append((group, what, outcome))
+
+
+          def get(url, timeout=25, tries=2):
+              last = ''
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': 'application/json, text/html;q=0.8, */*;q=0.5'})
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          return r.read(6000000)
+                  except urllib.error.HTTPError as e:
+                      last = 'HTTP %d' % e.code
+                      if e.code in (400, 401, 403, 404, 422):
+                          break
+                  except Exception as e:
+                      last = (type(e).__name__ + ': ' + str(e))[:80]
+                  time.sleep(2)
+              raise RuntimeError(last)
+
+
+          def jget(url):
+              return json.loads(get(url).decode('utf-8', 'replace'))
+
+
+          def parse_dt(s):
+              d = datetime.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+              return d if d.tzinfo else d.replace(tzinfo=UTC)
+
+
+          def local_date(ts):
+              return datetime.datetime.fromtimestamp(ts, TZ).date()
+
+
+          def tname(team, nat, short_only=False):
+              full = team.get('displayName') or team.get('name') or ''
+              short = team.get('shortDisplayName') or ''
+              n = (short or full or '?') if short_only else (full if (full and len(full) <= 16) else (short or full or '?'))
+              if nat:
+                  return ET.get(full or n, ET.get(n, n))
+              return n
+
+
+          def live_info(e):
+              """Football clock of a game that is on right now: phase, minute, stoppage minutes. None when not live."""
+              comp = (e.get('competitions') or [{}])[0]
+              s = comp.get('status') or e.get('status') or {}
+              ty = s.get('type') or {}
+              if ty.get('state') != 'in':
+                  return None
+              name = str(ty.get('name') or '').upper()
+              period = s.get('period') or 0
+              if 'HALFTIME' in name or 'END_OF' in name or 'BREAK' in name:
+                  ph = 'ht'
+              elif 'SHOOTOUT' in name or 'PENALT' in name or period >= 5:
+                  ph = 'pen'
+              elif period >= 3:
+                  ph = 'et'
+              elif period == 2:
+                  ph = '2'
+              elif period == 1:
+                  ph = '1'
+              else:
+                  ph = 'x'
+              mm = re.search(r"(\d+)\s*'?\s*(?:\+\s*(\d+))?", str(s.get('displayClock') or ''))
+              if mm and mm.group(1):
+                  m, x = int(mm.group(1)), int(mm.group(2) or 0)
+              else:
+                  try:
+                      m, x = int(float(s.get('clock') or 0) // 60), 0
+                  except (TypeError, ValueError):
+                      m, x = 0, 0
+              lv = dict(ph=ph, m=m, at=int(NOW.timestamp()))
+              if x:
+                  lv['x'] = x
+              if ph == 'et':
+                  lv['cap'] = 105 if period == 3 else 120
+              return lv
+
+
+          def live_info_bb(e):
+              """Basketball: which quarter (period 5 and up = overtime), or half-time. None when not live."""
+              comp = (e.get('competitions') or [{}])[0]
+              s = comp.get('status') or e.get('status') or {}
+              ty = s.get('type') or {}
+              if ty.get('state') != 'in':
+                  return None
+              if 'HALFTIME' in str(ty.get('name') or '').upper():
+                  return dict(ph='ht', at=int(NOW.timestamp()))
+              try:
+                  q = int(s.get('period') or 0)
+              except (TypeError, ValueError):
+                  q = 0
+              return dict(ph='q', q=q, at=int(NOW.timestamp()))
+
+
+          def game_from_event(e, tag, tier, src, nat=False, dur=135, lg=''):
+              """ESPN event (scoreboard, team schedule or nextEvent) -> our game record, or None."""
+              bb = lg.startswith('basketball/')
+              comp = (e.get('competitions') or [{}])[0]
+              home = away = None
+              for c in comp.get('competitors') or []:
+                  if c.get('homeAway') == 'home':
+                      home = c
+                  elif c.get('homeAway') == 'away':
+                      away = c
+              ids = []
+              if home and away:
+                  hn, an = tname(home.get('team') or {}, nat, bb), tname(away.get('team') or {}, nat, bb)
+                  ids = [str((home.get('team') or {}).get('id')), str((away.get('team') or {}).get('id'))]
+              else:
+                  nm = e.get('name') or ''
+                  if ' at ' in nm:
+                      an, hn = nm.split(' at ', 1)
+                  elif ' vs ' in nm:
+                      hn, an = nm.split(' vs ', 1)
+                  else:
+                      return None
+                  if nat:
+                      hn, an = ET.get(hn, hn), ET.get(an, an)
+              st = ((comp.get('status') or e.get('status') or {}).get('type') or {})
+              if re.search(r'POSTPONED|CANCEL|ABANDON', st.get('name', ''), re.I):
+                  return None
+              dt = e.get('date') or comp.get('date')
+              if not dt:
+                  return None
+              g = dict(id=('espn:nba:%s' if bb else 'espn:%s') % e.get('id'), c=tag, tier=tier, m='%s – %s' % (hn, an), t=int(parse_dt(dt).timestamp()),
+                       st=st.get('state') or 'pre', d=150 if bb else dur, src=src)
+              g['_ids'] = ids
+              if lg:
+                  g['lg'] = lg
+              lv = live_info_bb(e) if bb else live_info(e)
+              if lv:
+                  g['lv'] = lv
+              return g
+
+
+          def strip_tags(b):
+              t = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', b.decode('utf-8', 'replace'), flags=re.S | re.I)
+              return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', t))
+
+
+          # ---------------------------------------------------------------- old data (carried over when a source fails)
+          try:
+              OLD = json.load(open(OUT, encoding='utf-8'))
+          except Exception:
+              OLD = {}
+
+
+          # ---------------------------------------------------------------- 1. "on today" lists per competition
+          def board_task(job):
+              slug, tag, tier, day = job
+              src = 'espn:%s:%s' % (slug, day.strftime('%Y%m%d'))
+              try:
+                  d = jget(espn_url(slug) + '/scoreboard?dates=' + day.strftime('%Y%m%d'))
+                  return job, src, d.get('events') or [], ''
+              except RuntimeError as e:
+                  return job, src, None, str(e)
+
+
+          def walk(o):
+              if isinstance(o, dict):
+                  yield o
+                  for v in o.values():
+                      for x in walk(v):
+                          yield x
+              elif isinstance(o, list):
+                  for v in o:
+                      for x in walk(v):
+                          yield x
+
+
+          def top_flight_ids(slug):
+              try:
+                  d = jget(ESPN + slug + '/teams?limit=100')
+              except RuntimeError as e:
+                  log('Competitions', 'club list ' + slug, 'FAILED ' + str(e))
+                  return None
+              ids = set(str(o['id']) for o in walk(d) if isinstance(o, dict) and 'abbreviation' in o and 'id' in o)
+              log('Competitions', 'club list ' + slug, '%d clubs' % len(ids))
+              return ids
+
+
+          def collect_boards():
+              tops = {}
+              for lg in sorted(set(CUP_LEAGUE.values())):
+                  tops[lg] = top_flight_ids(lg)
+              jobs = [(s, t, r, d) for (s, t, r) in COMPS for d in (NBA_DAYS if s == NBA else DAYS)]
+              games, team_hits = [], []
+              with ThreadPoolExecutor(max_workers=6) as ex:
+                  results = list(ex.map(board_task, jobs))
+              per = {}
+              for job, src, events, err in results:
+                  slug, tag, tier, day = job
+                  if events is None:
+                      if err.startswith('HTTP 4'):
+                          log('Competitions', '%s %s' % (tag, day), 'no feed (%s)' % err)
+                          OK_SRC.add(src)              # nothing to carry over
+                      else:
+                          log('Competitions', '%s %s' % (tag, day), 'FAILED ' + err)
+                          BAD_SRC.add(src)
+                      continue
+                  OK_SRC.add(src)
+                  n = 0
+                  for e in events:
+                      g = game_from_event(e, tag, tier, src, nat=slug in ('fifa.world', 'uefa.euro'), lg=slug)
+                      if not g:
+                          continue
+                      if local_date(g['t']) not in DAYS:
+                          continue
+                      if slug in CUP_LEAGUE:
+                          top = tops.get(CUP_LEAGUE[slug])
+                          if not top or not (set(g.get('_ids', [])) & top):
+                              continue
+                      games.append(g)
+                      if slug != NBA:
+                          team_hits.append(g)
+                      n += 1
+                  per[(tag, day)] = n
+              for tag in [c[1] for c in COMPS]:
+                  total = sum(v for (t, d), v in per.items() if t == tag)
+                  if any(t == tag for (t, d) in per):
+                      log('Competitions', tag, '%d games today and tomorrow' % total)
+              return games, team_hits
+
+
+          # ---------------------------------------------------------------- 2. next games of the teams
+          def team_task(job):
+              key, slug, kind = job
+              t = TEAMS[key]
+              if kind == 'page':
+                  url = ESPN + '%s/teams/%s' % (slug, t['id'])
+              else:
+                  url = ESPN + '%s/teams/%s/schedule?fixture=true' % (slug, t['id'])
+              try:
+                  return job, jget(url), ''
+              except RuntimeError as e:
+                  return job, None, str(e)
+
+
+          def collect_teams(board_hits):
+              out = {}
+              jobs = [(k, s, kind) for k, t in TEAMS.items() if t['id'] for s in t['slugs'] for kind in ('page', 'sched')]
+              with ThreadPoolExecutor(max_workers=6) as ex:
+                  results = list(ex.map(team_task, jobs))
+              cands = {k: [] for k in TEAMS}
+              answered = set()
+              for job, d, err in results:
+                  key, slug, kind = job
+                  if d is None:
+                      continue
+                  answered.add(key)
+                  evs = []
+                  if kind == 'page':
+                      evs = ((d.get('team') or {}).get('nextEvent')) or []
+                  else:
+                      evs = d.get('events') or []
+                  for e in evs:
+                      g = game_from_event(e, '', 0, 'team:' + key, nat=TEAMS[key]['nat'], lg=slug)
+                      if g:
+                          cands[key].append(g)
+              for key, t in TEAMS.items():
+                  if not t['id']:
+                      continue
+                  for g in board_hits:
+                      if t['id'] in g.get('_ids', []):
+                          gg = dict(g)
+                          gg['src'] = 'team:' + key
+                          cands[key].append(gg)
+                  if key not in answered:
+                      old = (OLD.get('teams') or {}).get(key) or []
+                      for g in old:
+                          if g.get('src') != 'manual':
+                              cands[key].append(dict(g))
+                      log('Teams', key, 'FAILED (kept the older data)' if old else 'FAILED')
+                  else:
+                      log('Teams', key, '%d candidate games' % len(cands[key]))
+              # hand-kept extras (sports-extra.json): used where nothing automatic covers that date
+              try:
+                  extra = json.load(open(EXTRA, encoding='utf-8'))
+              except Exception:
+                  extra = {}
+              for key, lst in extra.items():
+                  if key not in TEAMS or not isinstance(lst, list):
+                      continue
+                  for x in lst:
+                      try:
+                          day = datetime.date.fromisoformat(x['date'])
+                          tm = x.get('time')
+                          if tm:
+                              dt = datetime.datetime(day.year, day.month, day.day, int(tm[:2]), int(tm[3:5]), tzinfo=TZ)
+                          else:
+                              dt = datetime.datetime(day.year, day.month, day.day, 12, 0, tzinfo=TZ)
+                          g = dict(id='manual:%s:%s' % (key, x['date']), c='', tier=0, m='%s – %s' % (x['home'], x['away']),
+                                   t=int(dt.timestamp()), st='pre', d=130 if key == 'eebb' else 135, src='manual')
+                          if not tm:
+                              g['tbc'] = 1
+                          if any(local_date(c['t']) == day and c.get('src') != 'manual' for c in cands[key]):
+                              continue
+                          cands[key].append(g)
+                      except Exception as e:
+                          log('Teams', 'extra file', 'could not read an entry: %s' % e)
+              for key in TEAMS:
+                  idx, lst = {}, []
+                  for g in sorted(cands[key], key=lambda g: g['t']):
+                      if g['t'] + g['d'] * 60 < NOW.timestamp():
+                          continue
+                      k = (g['t'], g['m'])
+                      if k in idx:
+                          if g.get('lv') and not lst[idx[k]].get('lv'):
+                              lst[idx[k]] = g            # prefer the copy that knows the clock
+                          continue
+                      idx[k] = len(lst)
+                      lst.append(g)
+                  out[key] = lst[:3]
+              return out
+
+
+          # ---------------------------------------------------------------- 3. Formula 1
+          F1_SES = {'Race': ('race', 120), 'Qualifying': ('quali', 75), 'Sprint': ('sprint', 45), 'Sprint Qualifying': ('sprintq', 60), 'Sprint Shootout': ('sprintq', 60)}
+
+
+          def collect_f1():
+              games = []
+              try:
+                  rows = jget('https://api.openf1.org/v1/sessions?year=%d' % D0.year)
+                  for s in rows:
+                      ses = F1_SES.get(s.get('session_name'))
+                      if not ses or not s.get('date_start'):
+                          continue
+                      t = int(parse_dt(s['date_start']).timestamp())
+                      if local_date(t) in DAYS:
+                          games.append(dict(id='f1:%s:%s' % (s.get('session_key'), ses[0]), c='F1', tier=1, m=s.get('location') or s.get('circuit_short_name') or 'F1',
+                                            k=ses[0], t=t, st='pre', d=ses[1], src='f1'))
+                  OK_SRC.add('f1')
+                  log('Formula 1', 'OpenF1', '%d sessions today and tomorrow' % len(games))
+                  return games
+              except RuntimeError as e:
+                  log('Formula 1', 'OpenF1', 'FAILED ' + str(e))
+              try:
+                  races = jget('https://api.jolpi.ca/ergast/f1/current.json')['MRData']['RaceTable']['Races']
+                  for r in races:
+                      name = r.get('Circuit', {}).get('Location', {}).get('locality') or r.get('raceName')
+                      parts = [('race', r, 120), ('quali', r.get('Qualifying'), 75), ('sprint', r.get('Sprint'), 45), ('sprintq', r.get('SprintQualifying') or r.get('SprintShootout'), 60)]
+                      for k, p, dur in parts:
+                          if p and p.get('date') and p.get('time'):
+                              t = int(parse_dt(p['date'] + 'T' + p['time']).timestamp())
+                              if local_date(t) in DAYS:
+                                  games.append(dict(id='f1:%s:%s' % (r.get('round'), k), c='F1', tier=1, m=name, k=k, t=t, st='pre', d=dur, src='f1'))
+                  OK_SRC.add('f1')
+                  log('Formula 1', 'Jolpica (backup)', '%d sessions today and tomorrow' % len(games))
+              except Exception as e:
+                  BAD_SRC.add('f1')
+                  log('Formula 1', 'Jolpica (backup)', 'FAILED ' + str(e)[:60])
+              return games
+
+
+          # ---------------------------------------------------------------- 4. WRC (read from wrc.com's calendar page)
+          def collect_wrc():
+              games = []
+              try:
+                  text = strip_tags(get('https://www.wrc.com/en/calendar/'))
+              except RuntimeError as e:
+                  BAD_SRC.add('wrc')
+                  log('WRC', 'wrc.com calendar', 'FAILED ' + str(e))
+                  return games
+              OK_SRC.add('wrc')
+              n = 0
+              pat = re.compile(r'(Rally(?:e)?\b[^0-9]{3,40}?)\s+(\d{4})\s+(\d{1,2})(?:\s+([A-Za-z]+))?\s*[–-]\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})')
+              for m in pat.finditer(text):
+                  name = m.group(1).strip()
+                  d1, mo1, d2, mo2, yr = int(m.group(3)), (m.group(4) or m.group(6)).lower(), int(m.group(5)), m.group(6).lower(), int(m.group(7))
+                  if mo1 not in MONTHS or mo2 not in MONTHS:
+                      continue
+                  try:
+                      start = datetime.date(yr, MONTHS[mo1], d1)
+                      end = datetime.date(yr, MONTHS[mo2], d2)
+                  except ValueError:
+                      continue
+                  n += 1
+                  for day in DAYS:
+                      if start <= day <= end:
+                          t = int(datetime.datetime(day.year, day.month, day.day, 0, 0, tzinfo=TZ).timestamp())
+                          games.append(dict(id='wrc:%s:%s' % (name, day), c='WRC', tier=1, m=name, t=t, st='in', d=1440, allday=1,
+                                            dn=(day - start).days + 1, dt=(end - start).days + 1, src='wrc'))
+              log('WRC', 'wrc.com calendar', '%d events listed; %d running today or tomorrow' % (n, len(games)))
+              return games
+
+
+          # ---------------------------------------------------------------- 5. live refresh (runs every few minutes, only touches games that are on now)
+          FULL_EVERY = 50 * 60          # a full collection at least this often (seconds)
+          F1_LAPS = {'sao paulo': 71, 'são paulo': 71, 'interlagos': 71, 'las vegas': 50, 'lusail': 57, 'losail': 57, 'qatar': 57,
+                     'abu dhabi': 58, 'yas': 58}
+          MODE = os.environ.get('SPORTS_MODE', 'auto')      # full | auto
+
+
+          def live_window(g, now):
+              if g.get('allday') or g.get('st') == 'post':
+                  return False
+              return g['t'] - 15 * 60 <= now <= g['t'] + g.get('d', 135) * 60 + 45 * 60
+
+
+          def f1_live():
+              """Ask ESPN's Formula 1 scoreboard what is running now; look for 'lap x of y'. The raw status goes to the log so it can be tuned."""
+              try:
+                  d = jget('https://site.api.espn.com/apis/site/v2/sports/racing/f1/scoreboard')
+              except RuntimeError as e:
+                  log('Live', 'F1 (ESPN)', 'FAILED ' + str(e))
+                  return None
+              for ev in d.get('events') or []:
+                  for c in ev.get('competitions') or []:
+                      s = c.get('status') or {}
+                      if (s.get('type') or {}).get('state') != 'in':
+                          continue
+                      ty = c.get('type') or {}
+                      kind = ' '.join(str(x) for x in (ty.get('abbreviation'), ty.get('text'), c.get('name'), ev.get('name'))).lower()
+                      blob = json.dumps(s, ensure_ascii=False)
+                      log('Live', 'F1 raw status', blob[:380].replace('|', '/'))
+                      lap = tot = None
+                      m = re.search(r'[Ll]ap\D{0,3}(\d+)\s*(?:/|of|OF)\s*(\d+)', blob)
+                      if m:
+                          lap, tot = int(m.group(1)), int(m.group(2))
+                      else:
+                          for o in walk(c):
+                              for k, v in o.items():
+                                  kl = str(k).lower()
+                                  if isinstance(v, (int, float)) and not isinstance(v, bool):
+                                      if kl in ('currentlap', 'lap', 'lapscompleted') and lap is None:
+                                          lap = int(v)
+                                      elif kl in ('totallaps', 'numberoflaps', 'laps', 'scheduledlaps') and tot is None:
+                                          tot = int(v)
+                      return dict(race=('race' in kind and 'qual' not in kind), lap=lap, of=tot, kind=kind[:60], raw=blob[:600])
+              log('Live', 'F1 (ESPN)', 'no session running')
+              return None
+
+
+          def live_refresh(old):
+              """Patch the games that are on right now in the existing sports.json. Returns the new data, or None when nothing is on."""
+              now = NOW.timestamp()
+              teams = old.get('teams') or {}
+              allg = list(old.get('games') or []) + [g for lst in teams.values() for g in lst]
+              cand = [g for g in allg if live_window(g, now) and (g.get('lg') or g.get('src') == 'f1')]
+              if not cand:
+                  return None
+              by_id = {}
+              for g in allg:
+                  by_id.setdefault(g['id'], []).append(g)
+              jobs = set()
+              for g in cand:
+                  if g.get('lg'):
+                      d = local_date(g['t'])
+                      jobs.add((g['lg'], d))
+                      jobs.add((g['lg'], d - datetime.timedelta(days=1)))
+              def one(job):
+                  slug, day = job
+                  try:
+                      return job, jget(espn_url(slug) + '/scoreboard?dates=' + day.strftime('%Y%m%d')).get('events') or [], ''
+                  except RuntimeError as e:
+                      return job, None, str(e)
+              with ThreadPoolExecutor(max_workers=4) as ex:
+                  res = list(ex.map(one, sorted(jobs)))
+              seen_live = []
+              for job, events, err in res:
+                  if events is None:
+                      log('Live', '%s %s' % (job[0], job[1]), 'FAILED ' + err)
+                      continue
+                  for e in events:
+                      gid = ('espn:nba:%s' if job[0] == NBA else 'espn:%s') % e.get('id')
+                      if gid not in by_id:
+                          continue
+                      comp = (e.get('competitions') or [{}])[0]
+                      state = ((comp.get('status') or e.get('status') or {}).get('type') or {}).get('state') or 'pre'
+                      lv = live_info_bb(e) if job[0] == NBA else live_info(e)
+                      for g in by_id[gid]:
+                          g['st'] = state
+                          if lv:
+                              g['lv'] = lv
+                          else:
+                              g.pop('lv', None)
+                      if lv and 'm' in lv:
+                          clock = "%s %d'%s" % (lv['ph'], lv['m'], '+%d' % lv['x'] if lv.get('x') else '')
+                      elif lv:
+                          clock = '%s q%s' % (lv['ph'], lv.get('q', ''))
+                      else:
+                          clock = state
+                      seen_live.append('%s: %s' % (by_id[gid][0]['m'], clock))
+              for s in sorted(set(seen_live)):
+                  log('Live', 'football', s)
+              f1 = [g for g in cand if g.get('src') == 'f1']
+              if f1:
+                  info = f1_live()
+                  for g in f1:
+                      if info and g.get('k') == 'race' and info['race']:
+                          tot = info['of']
+                          if not tot:
+                              low = str(g.get('m', '')).lower()
+                              for k, v in F1_LAPS.items():
+                                  if k in low:
+                                      tot = v
+                          lv = dict(at=int(now))
+                          if info['lap']:
+                              lv['lap'] = info['lap']
+                          if tot:
+                              lv['of'] = tot
+                          g['lv'] = lv
+                          g['st'] = 'in'
+              out = dict(old)
+              out['gen'] = int(now)
+              if f1 and info:
+                  dbg = dict(old.get('dbg') or {})
+                  dbg['f1'] = dict(at=int(now), kind=info['kind'], raw=info['raw'])      # what ESPN said, kept for tuning the lap display
+                  out['dbg'] = dbg
+              return out
+
+
+          # ---------------------------------------------------------------- put it together
+          def write_summary(lines):
+              text = '\n'.join(lines)
+              print(text)
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+                      f.write(text + '\n')
+
+
+          def main():
+              if MODE != 'full' and OLD.get('v') == 1:
+                  age = NOW.timestamp() - OLD.get('full', OLD.get('gen', 0))
+                  if age < FULL_EVERY:
+                      res = live_refresh(OLD)
+                      if res is None:
+                          print('Nothing is on right now and the last full collection is only %d min old - nothing to do.' % (age // 60))
+                          return
+                      lines = ['## Sports live refresh', '', 'Run at %s UTC.' % NOW.strftime('%Y-%m-%d %H:%M'), '', '| Group | Source | Result |', '|---|---|---|']
+                      for g, w, o in DIAG:
+                          lines.append('| %s | %s | %s |' % (g, w, o.replace('|', '/')))
+                      write_summary(lines)
+                      with open(OUT, 'w', encoding='utf-8') as f:
+                          json.dump(res, f, ensure_ascii=True, separators=(',', ':'))
+                      return
+              games, board_hits = collect_boards()
+              teams = collect_teams(board_hits)
+              games += collect_f1() + collect_wrc()
+              # carry over what failed this time
+              have = set(g['id'] for g in games)
+              for g in OLD.get('games') or []:
+                  if g.get('src') in BAD_SRC and g['id'] not in have and local_date(g['t']) in DAYS:
+                      games.append(g)
+              seen, final = set(), []
+              for g in sorted(games, key=lambda g: (g['t'], g['id'])):
+                  if g['id'] in seen:
+                      continue
+                  seen.add(g['id'])
+                  final.append(g)
+              for g in final:
+                  g.pop('_ids', None)
+              for lst in teams.values():
+                  for g in lst:
+                      g.pop('_ids', None)
+              result = {'v': 1, 'gen': int(NOW.timestamp()), 'full': int(NOW.timestamp()), 'teams': teams, 'games': final}
+              if OLD.get('dbg'):
+                  result['dbg'] = OLD['dbg']
+              try:
+                  fresh = live_refresh(result)       # anything on right now gets its clock (lap counts for F1 come only from here)
+                  if fresh:
+                      result = fresh
+              except Exception as e:
+                  log('Live', 'refresh after the full run', 'FAILED ' + str(e)[:60])
+
+              lines = ['## Sports data', '', 'Run at %s UTC (Estonian date %s).' % (NOW.strftime('%Y-%m-%d %H:%M'), D0), '', '| Group | Source | Result |', '|---|---|---|']
+              for g, w, o in DIAG:
+                  lines.append('| %s | %s | %s |' % (g, w, o.replace('|', '/')))
+              lines += ['', 'Team rows: ' + ', '.join('%s=%s' % (k, (lst[0]['m'] if lst else 'none')) for k, lst in teams.items()),
+                        'Games in the file: %d.' % len(final)]
+              write_summary(lines)
+
+              if not final and not any(teams.values()):
+                  print('::warning::Nothing could be fetched this time; the previous sports.json stays in place.')
+                  return
+              with open(OUT, 'w', encoding='utf-8') as f:
+                  json.dump(result, f, ensure_ascii=True, separators=(',', ':'))
+
+
+          if __name__ == '__main__':
+              main()
+          PY
+
+      - name: Publish sports.json
+        run: |
+          git config user.name "weather-bot"
+          git config user.email "weather-bot@users.noreply.github.com"
+          if [ ! -f sports.json ]; then
+            echo "No sports.json to publish."
+            exit 0
+          fi
+          git add sports.json
+          if git diff --cached --quiet; then
+            echo "Nothing to publish."
+            exit 0
+          fi
+          # keep the repository history short: reuse the bot's own last commit instead of adding a new one every time
+          if [ "$(git log -1 --format=%an)" = "weather-bot" ]; then
+            git commit --amend --no-edit -q
+            git push --force-with-lease -q origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::Push skipped (the repository changed meanwhile); the next run will try again."
+          else
+            git commit -q -m "Update sports data"
+            git push -q origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::Push skipped (the repository changed meanwhile); the next run will try again."
+          fi
