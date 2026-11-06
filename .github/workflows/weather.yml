@@ -1,0 +1,89 @@
+name: Weather data
+
+# Fetches the forecast from Open-Meteo every 30 minutes and saves it as data.json next to the page,
+# so an old iPad that cannot talk to the weather server itself can still read it from github.io.
+# The location comes from two hidden repository secrets (LAT and LON) and is NOT written into data.json.
+
+on:
+  schedule:
+    - cron: '9,39 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weather-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch forecast
+        env:
+          LAT: ${{ secrets.LAT }}
+          LON: ${{ secrets.LON }}
+          OM_BASE: https://api.open-meteo.com/v1/forecast
+        run: |
+          set -u
+          if [ -z "${LAT:-}" ] || [ -z "${LON:-}" ]; then
+            echo "::error::The secrets LAT and LON are missing (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          VARS="temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+          TAIL="&daily=weather_code&timezone=auto&past_days=1&forecast_days=5&wind_speed_unit=ms"
+          SET7="ecmwf_ifs,icon_seamless,gfs_seamless,meteofrance_seamless,ukmo_seamless,metno_nordic,dmi_harmonie_arome_europe"
+          SET5="ecmwf_ifs,icon_seamless,gfs_seamless,meteofrance_seamless,ukmo_seamless"
+          SET3="ecmwf_ifs025,icon_seamless,gfs_seamless"
+          OK=0
+          for MODELS in "$SET7" "$SET5" "$SET3" ""; do
+            URL="${OM_BASE}?latitude=${LAT}&longitude=${LON}&hourly=${VARS}${TAIL}"
+            if [ -n "$MODELS" ]; then URL="${URL}&models=${MODELS}"; fi
+            rm -f raw.json
+            if curl -fsS --retry 2 --retry-delay 5 --max-time 60 -o raw.json "$URL" 2>/dev/null; then
+              if MODELS="$MODELS" python3 - <<'PY'
+          import json, os, datetime, sys
+          d = json.load(open('raw.json'))
+          h = d.get('hourly') or {}
+          if not h.get('time'):
+              sys.exit(1)
+          for k in ('latitude', 'longitude', 'elevation', 'generationtime_ms', 'current', 'current_units'):
+              d.pop(k, None)
+          m = os.environ.get('MODELS', '')
+          d['_relay'] = True
+          d['_models'] = m.split(',') if m else []
+          d['_fetched'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          json.dump(d, open('data.json', 'w'), separators=(',', ':'))
+          PY
+              then
+                OK=1
+                echo "Fetched with model set: ${MODELS:-default}"
+                break
+              fi
+            fi
+          done
+          rm -f raw.json
+          if [ "$OK" != "1" ]; then
+            echo "::warning::Could not fetch the forecast this time; the previous data.json stays in place."
+          fi
+
+      - name: Publish data.json
+        run: |
+          git config user.name "weather-bot"
+          git config user.email "weather-bot@users.noreply.github.com"
+          git add data.json
+          if git diff --cached --quiet; then
+            echo "Nothing to publish."
+            exit 0
+          fi
+          # keep the repository history short: reuse the bot's own last commit instead of adding a new one every time
+          if [ "$(git log -1 --format=%an)" = "weather-bot" ]; then
+            git commit --amend --no-edit -q
+            git push --force-with-lease -q origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::Push skipped (the repository changed meanwhile); the next run will try again."
+          else
+            git commit -q -m "Update weather data"
+            git push -q origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::Push skipped (the repository changed meanwhile); the next run will try again."
+          fi
